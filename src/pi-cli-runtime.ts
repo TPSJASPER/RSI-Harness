@@ -263,7 +263,11 @@ function readSessionEntries(path) {
 function rememberedSessionDirectories(cwd) {
   try {
     const index = JSON.parse(readFileSync(join(getPiAgentDir(), "session-directories.json"), "utf8"));
-    return (index[cwd] ?? []).filter(directory => typeof directory === "string");
+    // Older migrations indexed a shared legacy directory only for the first
+    // project opened. Search all known directories to recover the others too;
+    // Pi's session listing still filters each directory by the current cwd.
+    return [...new Set([...(index[cwd] ?? []), ...Object.values(index).flat()])]
+      .filter(directory => typeof directory === "string");
   } catch {
     return [];
   }

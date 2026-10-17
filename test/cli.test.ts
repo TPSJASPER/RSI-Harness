@@ -6,6 +6,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  rmSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -767,6 +768,63 @@ test("legacy managed sessionDir is indexed before shared settings migrate", () =
   assert.ok(JSON.parse(readFileSync(join(agent, "session-directories.json"), "utf8"))[
     realpathSync(directory)
   ].includes(sessions), "legacy session directory must stay discoverable");
+});
+
+test("legacy shared sessions remain discoverable across projects after migration", t => {
+  const directory = mkdtempSync(join(tmpdir(), "rsih-cli-legacy-shared-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const agent = join(directory, ".rsih-agent");
+  const sessions = join(directory, "legacy-sessions");
+  const projects = ["a", "b", "unrelated"].map(name => join(directory, name));
+  for (const project of projects) mkdirSync(project);
+  const genomePath = join(directory, "genome.json");
+  const providers = join(directory, "providers.json");
+  writeFileSync(providers, JSON.stringify({ mock: {
+    kind: "mock", model: "legacy-shared-model", mock_responses: ["ok"],
+  } }));
+  writeFileSync(genomePath, JSON.stringify(createHarnessGenome({
+    genome_id: "harness:legacy-shared",
+    model: { profile: "mock", id: "legacy-shared-model" },
+    settings: { sessionDir: sessions },
+  })));
+  const run = (cwd, ...args) => {
+    const result = runCli(directory, ["-p", "Continue.", "--config", providers,
+      "--profile", "mock", "--cwd", cwd, ...args]);
+    assert.equal(result.status, 0, result.stderr);
+  };
+  const entries = id => {
+    const records = readdirSync(sessions).filter(name => name.endsWith(".jsonl"))
+      .map(name => readFileSync(join(sessions, name), "utf8").trim().split(/\r?\n/).map(line => JSON.parse(line)));
+    return records.find(records => records[0].id === id);
+  };
+  const userMessages = id => entries(id).filter(entry => entry.type === "message" && entry.message.role === "user").length;
+  run(projects[0], "--genome", genomePath, "--run-id", "legacy-a");
+  run(projects[1], "--genome", genomePath, "--run-id", "legacy-b");
+
+  // Old releases stored the shared directory globally, without a per-project index.
+  writeFileSync(join(agent, "settings.json"), JSON.stringify({
+    theme: "dark", sessionDir: sessions,
+    $rsih: { genome: "legacy", managedKeys: ["sessionDir"] },
+  }));
+  rmSync(join(agent, "session-directories.json"), { force: true });
+  run(projects[1], "--continue");
+  assert.equal(userMessages("legacy-b"), 2);
+  assert.deepEqual(JSON.parse(readFileSync(join(agent, "settings.json"), "utf8")), { theme: "dark" });
+  const index = JSON.parse(readFileSync(join(agent, "session-directories.json"), "utf8"));
+  assert.ok(index[realpathSync(projects[1])].includes(sessions));
+  assert.equal(index[realpathSync(projects[0])], undefined,
+    "the remaining lookup must also recover projects omitted by an earlier migration");
+
+  run(projects[0], "--continue");
+  assert.equal(userMessages("legacy-a"), 2, "continue must append to the original shared-directory session");
+  // Reproduce the omitted entry again so run-id lookup is tested independently.
+  writeFileSync(join(agent, "session-directories.json"), JSON.stringify(index));
+  run(projects[0], "--run-id", "legacy-a");
+  assert.equal(userMessages("legacy-a"), 3, "a run id must recover the original conversation too");
+  assert.equal(userMessages("legacy-b"), 2, "project A must not append to project B's session");
+
+  run(projects[2], "--run-id", "legacy-a");
+  assert.equal(userMessages("legacy-a"), 3, "an unrelated project must not adopt the same id from shared history");
 });
 
 test("CLI discovers a named Genome and resumes its Pi session", () => {
