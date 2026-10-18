@@ -67,6 +67,7 @@ import {
   shouldSaveSnapshot,
 } from "./harness/configuration-snapshot.ts";
 import { runGenomeCommand } from "./cli/genome-command.ts";
+import { installRememberedSessionListing } from "./harness/session-selector.ts";
 import {
   SUPERVISED_ENV,
   RESTORED_EDITOR_ENV,
@@ -294,16 +295,30 @@ function rememberSessionDirectory(cwd, sessionFile) {
   rememberSessionDirectoryPath(cwd, dirname(sessionFile));
 }
 
+function sessionPathArgument(path, cwd) {
+  // Pi's path resolver expands a leading tilde before resolving the cwd.
+  const expanded = path === "~"
+    ? homedir()
+    : path.startsWith("~/") || (process.platform === "win32" && path.startsWith("~\\"))
+      ? join(homedir(), path.slice(2))
+      : path;
+  return resolve(cwd, expanded);
+}
+
+function looksLikeSessionPath(value) {
+  return isAbsolute(value) ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    value.endsWith(".jsonl");
+}
+
 async function findSessionFile(args, sessionDirectories, cwd) {
   if (hasOption(args, "--no-session", "--resume", "-r")) return undefined;
   // A CLI fork creates a new file, but inherits the source's frozen Genome.
   const requested = optionValue(args, "--session") ?? optionValue(args, "--fork");
-  if (requested && (
-      isAbsolute(requested) ||
-      requested.includes("/") ||
-      requested.includes("\\") ||
-      requested.endsWith(".jsonl")
-  )) return { path: resolve(cwd, requested), local: false };
+  if (requested && looksLikeSessionPath(requested)) {
+    return { path: sessionPathArgument(requested, cwd), local: false };
+  }
   const exactId = optionValue(args, "--session-id");
   if (!requested && !exactId && !hasOption(args, "--continue", "-c")) return undefined;
 
@@ -1641,8 +1656,15 @@ export async function runPiCli(argv) {
     ? [sessionDirectory] : [sessionDirectory, ...rememberedSessionDirectories(cwd)];
   const selectedSession = await findSessionFile(parsed.piArgs, directories, cwd);
   const existingSession = selectedSession?.path;
-  const projectCwd = existingSession ? storedSessionCwd(existingSession) ?? cwd : cwd;
   const sourceOption = hasOption(parsed.piArgs, "--fork") ? "--fork" : "--session";
+  const sourceArgument = optionValue(parsed.piArgs, sourceOption);
+  // --fork always creates a session for the invoking cwd. A global --session ID
+  // also forks there after Pi's confirmation; only opening a session keeps its
+  // saved cwd. Determine this before the extension starts its stdio MCP servers.
+  const createsFork = sourceOption === "--fork" ||
+    (sourceArgument && !looksLikeSessionPath(sourceArgument) && selectedSession?.local === false);
+  const projectCwd = createsFork ? cwd :
+    existingSession ? storedSessionCwd(existingSession) ?? cwd : cwd;
   if (existingSession && (sourceOption === "--fork" || selectedSession.local)) {
     // Pi must open the exact source we resolved, including remembered custom
     // directories. Keep --fork and its new target id; retain Pi's confirmation
@@ -1822,8 +1844,18 @@ export async function runPiCli(argv) {
       cliOverridesThinking: hasOption(parsed.piArgs, "--thinking"),
       cwd: projectCwd,
     });
-    await runPiMain([...genomeArgs, ...parsed.piArgs], {
-      extensionFactories: [extensionFactory],
-    });
+    // Pi owns both the startup --resume picker and the in-TUI /resume picker.
+    // Scope the additional directories to the default Pi store; an explicit
+    // Genome or session directory must not acquire another store's sessions.
+    const restoreSessionListing = directories.length > 1
+      ? installRememberedSessionListing(SessionManager, cwd, sessionDirectory, directories.slice(1))
+      : () => {};
+    try {
+      await runPiMain([...genomeArgs, ...parsed.piArgs], {
+        extensionFactories: [extensionFactory],
+      });
+    } finally {
+      restoreSessionListing();
+    }
   });
 }
