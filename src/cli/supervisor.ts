@@ -20,13 +20,17 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseArgs } from "@earendil-works/pi-coding-agent";
 
 /** Set on the child so it knows a supervisor is waiting to restart it. */
 export const SUPERVISED_ENV = "RSIH_SUPERVISED";
 /** Set on a restarted child so it can tell the user and the model why. */
 export const SWITCHED_FROM_ENV = "RSIH_SWITCHED_FROM";
+export const SWITCH_REQUEST_ID_ENV = "RSIH_SWITCH_REQUEST_ID";
+export const RESTORED_EDITOR_ENV = "RSIH_RESTORED_EDITOR";
 const REQUEST_FILE = ".switch-genome.json";
 
 /**
@@ -48,22 +52,22 @@ export function wantsInteractive(argv, { stdin = process.stdin, stdout = process
   return true;
 }
 
-function requestPath(agentDirectory) {
-  return join(agentDirectory, REQUEST_FILE);
+function requestPath(agentDirectory, requestId) {
+  return join(agentDirectory, requestId ? `.switch-genome-${requestId}.json` : REQUEST_FILE);
 }
 
 /**
  * Written by the child just before it asks Pi to quit. Synchronous on purpose:
  * Pi's shutdown ends the process, so the write has to be complete first.
  */
-export function writeSwitchRequest(agentDirectory, request) {
+export function writeSwitchRequest(agentDirectory, request, requestId = process.env[SWITCH_REQUEST_ID_ENV]) {
   mkdirSync(agentDirectory, { recursive: true });
-  writeFileSync(requestPath(agentDirectory), `${JSON.stringify(request)}\n`, "utf8");
+  writeFileSync(requestPath(agentDirectory, requestId), `${JSON.stringify(request)}\n`, "utf8");
 }
 
 /** Read and remove the request, so a crash later can never replay it. */
-export function takeSwitchRequest(agentDirectory) {
-  const path = requestPath(agentDirectory);
+export function takeSwitchRequest(agentDirectory, requestId = process.env[SWITCH_REQUEST_ID_ENV]) {
+  const path = requestPath(agentDirectory, requestId);
   if (!existsSync(path)) return undefined;
   let request;
   try {
@@ -85,25 +89,49 @@ const REPLACED_OPTIONS = new Set([
   "--fork",
 ]);
 const REPLACED_FLAGS = new Set(["--continue", "-c", "--resume", "-r", "--new"]);
+const RSIH_VALUE_OPTIONS = new Set(["--profile", "--config", "--env", "--cwd", "--max-turns"]);
+
+/** Ask Pi about its own options, including the consumption of extension flags. */
+function takesValue(argument, next) {
+  if (next === undefined || argument.includes("=")) return false;
+  if (REPLACED_OPTIONS.has(argument) || RSIH_VALUE_OPTIONS.has(argument)) return true;
+  const sample = parseArgs([argument, "rsih-restart-value"]);
+  if (sample.messages.length > 0) return false;
+  const flag = argument.slice(2);
+  return !sample.unknownFlags.has(flag) || parseArgs([argument, next]).unknownFlags.get(flag) === next;
+}
 
 /**
- * The argv for the restarted child: everything the user typed, minus how they
- * originally chose a Genome and a session, plus the switch's own answer to both.
+ * Keep runtime options, replacing session selection and removing consumed names
+ * and input. The startup --resume picker has not submitted its initial input yet.
  */
 export function restartArgv(argv, request) {
   const kept = [];
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
+    if (argument === "--") {
+      if (request.preserveInitialMessages) kept.push(...argv.slice(index));
+      break;
+    }
+    if (!argument.startsWith("-")) {
+      if (request.preserveInitialMessages) kept.push(argument);
+      continue;
+    }
     if (REPLACED_FLAGS.has(argument)) continue;
     const [name] = argument.split("=", 1);
-    if (REPLACED_OPTIONS.has(name)) {
-      if (!argument.includes("=")) index += 1;
+    const value = takesValue(argument, argv[index + 1]);
+    if (REPLACED_OPTIONS.has(name) || name === "--name" || name === "-n") {
+      if (value) index += 1;
       continue;
     }
     kept.push(argument);
+    if (value) kept.push(argv[++index]);
   }
   const session = request.sessionFile ? ["--session", request.sessionFile] : [];
-  return ["--genome", request.reference, ...session, ...kept];
+  // An in-app /resume must load the Genome frozen in the target session,
+  // not a potentially edited Genome at the same path on disk.
+  const genome = request.kind === "resume" ? [] : ["--genome", request.reference];
+  return [...genome, ...session, ...kept];
 }
 
 /**
@@ -131,6 +159,8 @@ export async function supervise({
 }) {
   let currentArgv = argv;
   let switchedFrom;
+  let restoredEditor;
+  const requestId = randomUUID();
   const recentRestarts = [];
   // Ctrl-C reaches the child directly through the shared terminal; the
   // supervisor's only job on a signal is to stay alive long enough to see the
@@ -140,9 +170,11 @@ export async function supervise({
 
   try {
     for (;;) {
-      const childEnv = { ...env, [SUPERVISED_ENV]: "1" };
+      const childEnv = { ...env, [SUPERVISED_ENV]: "1", [SWITCH_REQUEST_ID_ENV]: requestId };
       if (switchedFrom) childEnv[SWITCHED_FROM_ENV] = switchedFrom;
       else delete childEnv[SWITCHED_FROM_ENV];
+      if (restoredEditor !== undefined) childEnv[RESTORED_EDITOR_ENV] = restoredEditor;
+      else delete childEnv[RESTORED_EDITOR_ENV];
 
       const child = spawnChild(command, [...baseArgs, ...currentArgv], {
         stdio: "inherit",
@@ -165,7 +197,7 @@ export async function supervise({
 
       if (outcome.error) throw outcome.error;
 
-      const request = takeSwitchRequest(agentDirectory);
+      const request = takeSwitchRequest(agentDirectory, requestId);
       if (request && outcome.signal === null) {
         const at = now();
         while (recentRestarts.length > 0 && at - recentRestarts[0] > RESTART_WINDOW_MS) {
@@ -181,6 +213,7 @@ export async function supervise({
         }
         currentArgv = restartArgv(currentArgv, request);
         switchedFrom = request.from ?? undefined;
+        restoredEditor = request.editorText;
         continue;
       }
       if (outcome.signal) {
@@ -191,6 +224,7 @@ export async function supervise({
       return outcome.code ?? 0;
     }
   } finally {
+    rmSync(requestPath(agentDirectory, requestId), { force: true });
     process.off("SIGINT", ignore);
   }
 }

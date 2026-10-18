@@ -108,7 +108,7 @@ rsih +paperlab           # 加号简写
 
 ```bash
 rsih genome list                    # 装了什么、随发行版附带什么、哪些落后了
-rsih genome show paperlab           # 解析后的 Genome + 将写入的 settings 补丁（只读）
+rsih genome show paperlab           # 解析后的 Genome + 进程内 settings 投影（只读）
 rsih genome validate ./my-genome
 rsih genome install paperlab        # 取回出厂版本
 ```
@@ -257,11 +257,15 @@ skill 和 extension 也从那里读。**把一个 Genome 文件夹发给别人�
 | 有新版、你改过 | **不动**，只警告并给出 `rsih genome install <name>` |
 | 别人分享的同名 Genome | **不动**（`genome_id` 不同 → 绝不覆盖） |
 
-**settings 是编译出来的。** Pi 没有注入 settings 的 API，所以 Genome 声明的键每次
-启动重写进 `~/.rsih/settings.json`，未声明的键（包括 Pi 自己写的 `theme`、
-`defaultModel`）原样保留；换 Genome 时上一个托管、当前不再声明的键被清除。托管范围
-记在文件里的 `$rsih.managedKeys`。项目级 `<cwd>/.rsih/settings.json` 优先级高于
-Genome，是显式逃生阀。
+**运行设置按进程隔离。** Genome 在内存中覆盖用户默认设置，不再把自己的设置或快捷键
+写入共享的用户文件。多个会话可以使用不同 Genome，并独立重载。切换 Genome 会释放旧的
+覆盖项，恢复用户默认值。未被 Genome 托管的用户偏好仍然持久保存；被托管设置的临时修改
+只影响本次运行，重载时重新应用 Genome。账号、模型、历史和全局资源发现仍使用原来的
+位置。项目级 `<cwd>/.rsih/settings.json` 仍然优先于 Genome。
+
+会话快照包含解析后 Genome 的内容 hash。同名同路径的配置被修改并明确采用后，即使没有
+增加版本号，也会记录新快照；后续恢复使用最后采用的配置。仅修改磁盘文件不会自动改变
+已有会话。旧版快照仍可恢复。
 
 **语义字段与逃生阀。** `runtime.steering_mode`、`policies.compaction`、`model.cycle`
 这类语义字段会投影成对应的 Pi 设置；`settings` 组件是最低层的原始逃生阀，写在那里
@@ -293,3 +297,5 @@ npm run sync:contracts # 改过 docs/genome/components/ 之后同步到 bundle
 
 文档索引见 [docs/README.md](docs/README.md)。仓库不包含 benchmark、数据生成、训练
 或评测实现。
+
+通过 TUI 中的 `/resume` 选择其他 Genome 的历史会话时，Supervisor 会在新进程中恢复该会话保存的 Genome，而不是继续使用当前进程的配置。配置快照按活动会话分支读取，避免不同分支之间的配置相互覆盖。

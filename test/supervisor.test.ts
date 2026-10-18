@@ -7,6 +7,8 @@ import test from "node:test";
 import {
   SUPERVISED_ENV,
   SWITCHED_FROM_ENV,
+  SWITCH_REQUEST_ID_ENV,
+  RESTORED_EDITOR_ENV,
   restartArgv,
   supervise,
   takeSwitchRequest,
@@ -91,7 +93,7 @@ function scriptedSpawn(script, calls) {
     child.exitCode = null;
     child.kill = () => {};
     setImmediate(() => {
-      step?.before?.();
+      step?.before?.(options);
       child.exitCode = step?.code ?? 0;
       child.emit("exit", step?.code ?? 0, step?.signal ?? null);
     });
@@ -112,12 +114,12 @@ test("the supervisor restarts on a request and stops when there is none", async 
       spawnChild: scriptedSpawn(
         [
           {
-            before: () =>
+            before: ({ env }) =>
               writeSwitchRequest(directory, {
                 reference: "debate",
                 sessionFile: "/s/a.jsonl",
                 from: "dev",
-              }),
+              }, env[SWITCH_REQUEST_ID_ENV]),
           },
           { code: 0 },
         ],
@@ -143,6 +145,30 @@ test("the supervisor restarts on a request and stops when there is none", async 
     assert.equal(calls[1].env[SWITCHED_FROM_ENV], "dev");
     // The user's environment reaches the child untouched.
     assert.equal(calls[1].env.HOME, "/home/u");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("supervisors sharing an agent directory consume only their own switch requests", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "rsih-sup-parallel-"));
+  try {
+    const a = [];
+    const b = [];
+    const launch = (name, calls) => supervise({
+      command: "rsih", baseArgs: [], argv: ["--genome", name], agentDirectory: directory, env: {},
+      spawnChild: scriptedSpawn([
+        { before: ({ env }) => writeSwitchRequest(directory,
+          { reference: `${name}-next`, sessionFile: `/sessions/${name}.jsonl` }, env[SWITCH_REQUEST_ID_ENV]) },
+        { code: 0 },
+      ], calls),
+    });
+    assert.deepEqual(await Promise.all([launch("a", a), launch("b", b)]), [0, 0]);
+    assert.notEqual(a[0].env[SWITCH_REQUEST_ID_ENV], b[0].env[SWITCH_REQUEST_ID_ENV]);
+    assert.equal(a[1].args[1], "a-next");
+    assert.equal(b[1].args[1], "b-next");
+    assert.ok(a[1].args.includes("/sessions/a.jsonl"));
+    assert.ok(b[1].args.includes("/sessions/b.jsonl"));
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -174,8 +200,8 @@ test("a request left by a crash is honoured, but a restart storm is not", async 
     const stderr = { write: (text) => written.push(text) };
     let clock = 0;
     const calls = [];
-    const file = () =>
-      writeSwitchRequest(directory, { reference: "loop", sessionFile: "/s.jsonl" });
+    const file = ({ env }) =>
+      writeSwitchRequest(directory, { reference: "loop", sessionFile: "/s.jsonl" }, env[SWITCH_REQUEST_ID_ENV]);
     const code = await supervise({
       command: "rsih",
       baseArgs: [],
@@ -195,4 +221,59 @@ test("a request left by a crash is honoured, but a restart storm is not", async 
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+
+test("resume restart loads the target session's frozen Genome instead of passing --genome", () => {
+  const argv = ["--genome", "old", "--resume", "--cwd", "/work"];
+  const restarted = restartArgv(argv, {
+    kind: "resume",
+    reference: "different",
+    sessionFile: "/sessions/selected.jsonl",
+  });
+  assert.deepEqual(restarted, ["--session", "/sessions/selected.jsonl", "--cwd", "/work"]);
+});
+
+test("in-app restarts discard consumed input and names while retaining option values", () => {
+  const argv = ["--genome", "old", "--name", "Initial A", "--cwd", "/work",
+    "--model", "initial prompt", "--extension", "@extension.ts", "--custom", "custom value",
+    "--verbose", "initial prompt", "@notes.md", "--", "--literal-message"];
+  assert.deepEqual(restartArgv(argv, { kind: "resume", reference: "target", sessionFile: "/b.jsonl" }),
+    ["--session", "/b.jsonl", "--cwd", "/work", "--model", "initial prompt",
+      "--extension", "@extension.ts", "--custom", "custom value", "--verbose"]);
+  assert.deepEqual(restartArgv(["-n", "Old name", "hello", "@notes.md"], { reference: "new" }),
+    ["--genome", "new"]);
+});
+
+test("startup restoration retains pending input once, without renaming the session again", () => {
+  const argv = ["--resume", "--name", "Target", "--cwd", "/work", "hello", "@notes.md", "--", "--literal"];
+  const startup = restartArgv(argv, { kind: "resume", reference: "target", sessionFile: "/b.jsonl",
+    preserveInitialMessages: true });
+  assert.deepEqual(startup, ["--session", "/b.jsonl", "--cwd", "/work", "hello", "@notes.md", "--", "--literal"]);
+  assert.deepEqual(restartArgv(startup, { kind: "resume", reference: "other", sessionFile: "/c.jsonl" }),
+    ["--session", "/c.jsonl", "--cwd", "/work"]);
+});
+
+test("restart input filtering follows Pi's extension-flag parsing and preserves RSIH paths", () => {
+  assert.deepEqual(restartArgv(["--custom", "@input.md", "--cwd", "@project", "--append-system-prompt", "--name"],
+    { kind: "resume", reference: "target", sessionFile: "/b.jsonl" }),
+    ["--session", "/b.jsonl", "--custom", "--cwd", "@project", "--append-system-prompt", "--name"]);
+});
+
+test("the supervisor carries a branch draft only to the requested restart", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "rsih-editor-restore-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const calls = [];
+  await supervise({
+    command: "rsih", baseArgs: [], argv: [], agentDirectory: directory, env: {},
+    spawnChild: scriptedSpawn([
+      { before: ({ env }) => writeSwitchRequest(directory,
+        { kind: "resume", reference: "demo", sessionFile: "/a.jsonl", editorText: "Re-edit this question." }, env[SWITCH_REQUEST_ID_ENV]) },
+      { before: ({ env }) => writeSwitchRequest(directory,
+        { kind: "resume", reference: "demo", sessionFile: "/b.jsonl" }, env[SWITCH_REQUEST_ID_ENV]) },
+      {},
+    ], calls),
+  });
+  assert.equal(calls[1].env[RESTORED_EDITOR_ENV], "Re-edit this question.");
+  assert.equal(calls[2].env[RESTORED_EDITOR_ENV], undefined);
 });
