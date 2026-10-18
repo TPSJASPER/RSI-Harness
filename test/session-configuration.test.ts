@@ -133,6 +133,53 @@ test("fork and clone preflight use the retained ancestry, including boundary ent
   assert.deepEqual(sessionForkBranchEntries(entries, "missing", "before"), []);
 });
 
+test("default Genome /tree keeps matching configuration without reopening the session", async t => {
+  const root = mkdtempSync(join(tmpdir(), "rsih-default-tree-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const agent = join(root, "agent");
+  const cwd = join(root, "project");
+  mkdirSync(cwd, { recursive: true });
+
+  const manager = SessionManager.create(cwd, join(agent, "sessions"));
+  const genome = createDefaultHarnessGenome();
+  manager.appendCustomEntry("rsih.genome", { reference: "default", baseDirectory: cwd, genome });
+  manager.appendCustomEntry("rsih.configuration", createConfigurationSnapshot({}, {}, {
+    genome: "default", genomeId: genome.genome_id, rsih: "0.1.0",
+  }));
+  const selectedId = manager.appendMessage({
+    role: "user", content: [{ type: "text", text: "Edit this question." }], timestamp: Date.now(),
+  });
+  manager.appendMessage({
+    role: "assistant", content: [{ type: "text", text: "Original answer." }], timestamp: Date.now(),
+  });
+
+  const configuration = createRuntimeSettings(agent);
+  configuration.apply({ settings: {}, snapshotSettings: {}, keybindings: {} });
+  const session = createGenomeSession(
+    genomeActivation({ genome, reference: "default", baseDirectory: cwd }),
+    startupPromptRecord({}),
+  );
+  const handlers = new Map();
+  let appended = 0;
+  const pi = {
+    registerFlag() {}, registerCommand() {},
+    on(name, handler) { handlers.set(name, handler); },
+    appendEntry() { appended++; },
+    sendUserMessage() { assert.fail("unchanged /tree must not request a session restore"); },
+  };
+  const factory = await createGenomeExtension({ session, configuration, profiles: {}, cwd });
+  await factory(pi);
+  const ctx = { mode: "rpc", sessionManager: manager, ui: { getEditorText: () => "", notify() {} } };
+
+  const before = await handlers.get("session_before_tree")({ preparation: { targetId: selectedId } }, ctx);
+  assert.notEqual(before?.cancel, true);
+  const targetLeaf = manager.getEntry(selectedId).parentId;
+  manager.branch(targetLeaf);
+  await handlers.get("session_tree")({}, ctx);
+  assert.equal(appended, 0, "an unchanged branch must not add an rsih.branch marker");
+  assert.equal(manager.getLeafId(), targetLeaf, "ordinary tree navigation still changes the active leaf");
+});
+
 async function frozenTreeFixture(t, restoreSessionOnStartup = false) {
   const root = mkdtempSync(join(tmpdir(), "rsih-frozen-tree-"));
   const agent = join(root, "agent");
