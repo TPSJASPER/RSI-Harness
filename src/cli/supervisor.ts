@@ -23,12 +23,14 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseArgs } from "@earendil-works/pi-coding-agent";
 
 /** Set on the child so it knows a supervisor is waiting to restart it. */
 export const SUPERVISED_ENV = "RSIH_SUPERVISED";
 /** Set on a restarted child so it can tell the user and the model why. */
 export const SWITCHED_FROM_ENV = "RSIH_SWITCHED_FROM";
 export const SWITCH_REQUEST_ID_ENV = "RSIH_SWITCH_REQUEST_ID";
+export const RESTORED_EDITOR_ENV = "RSIH_RESTORED_EDITOR";
 const REQUEST_FILE = ".switch-genome.json";
 
 /**
@@ -87,22 +89,43 @@ const REPLACED_OPTIONS = new Set([
   "--fork",
 ]);
 const REPLACED_FLAGS = new Set(["--continue", "-c", "--resume", "-r", "--new"]);
+const RSIH_VALUE_OPTIONS = new Set(["--profile", "--config", "--env", "--cwd", "--max-turns"]);
+
+/** Ask Pi about its own options, including the consumption of extension flags. */
+function takesValue(argument, next) {
+  if (next === undefined || argument.includes("=")) return false;
+  if (REPLACED_OPTIONS.has(argument) || RSIH_VALUE_OPTIONS.has(argument)) return true;
+  const sample = parseArgs([argument, "rsih-restart-value"]);
+  if (sample.messages.length > 0) return false;
+  const flag = argument.slice(2);
+  return !sample.unknownFlags.has(flag) || parseArgs([argument, next]).unknownFlags.get(flag) === next;
+}
 
 /**
- * The argv for the restarted child: everything the user typed, minus how they
- * originally chose a Genome and a session, plus the switch's own answer to both.
+ * Keep runtime options, replacing session selection and removing consumed names
+ * and input. The startup --resume picker has not submitted its initial input yet.
  */
 export function restartArgv(argv, request) {
   const kept = [];
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
+    if (argument === "--") {
+      if (request.preserveInitialMessages) kept.push(...argv.slice(index));
+      break;
+    }
+    if (!argument.startsWith("-")) {
+      if (request.preserveInitialMessages) kept.push(argument);
+      continue;
+    }
     if (REPLACED_FLAGS.has(argument)) continue;
     const [name] = argument.split("=", 1);
-    if (REPLACED_OPTIONS.has(name)) {
-      if (!argument.includes("=")) index += 1;
+    const value = takesValue(argument, argv[index + 1]);
+    if (REPLACED_OPTIONS.has(name) || name === "--name" || name === "-n") {
+      if (value) index += 1;
       continue;
     }
     kept.push(argument);
+    if (value) kept.push(argv[++index]);
   }
   const session = request.sessionFile ? ["--session", request.sessionFile] : [];
   // An in-app /resume must load the Genome frozen in the target session,
@@ -136,6 +159,7 @@ export async function supervise({
 }) {
   let currentArgv = argv;
   let switchedFrom;
+  let restoredEditor;
   const requestId = randomUUID();
   const recentRestarts = [];
   // Ctrl-C reaches the child directly through the shared terminal; the
@@ -149,6 +173,8 @@ export async function supervise({
       const childEnv = { ...env, [SUPERVISED_ENV]: "1", [SWITCH_REQUEST_ID_ENV]: requestId };
       if (switchedFrom) childEnv[SWITCHED_FROM_ENV] = switchedFrom;
       else delete childEnv[SWITCHED_FROM_ENV];
+      if (restoredEditor !== undefined) childEnv[RESTORED_EDITOR_ENV] = restoredEditor;
+      else delete childEnv[RESTORED_EDITOR_ENV];
 
       const child = spawnChild(command, [...baseArgs, ...currentArgv], {
         stdio: "inherit",
@@ -187,6 +213,7 @@ export async function supervise({
         }
         currentArgv = restartArgv(currentArgv, request);
         switchedFrom = request.from ?? undefined;
+        restoredEditor = request.editorText;
         continue;
       }
       if (outcome.signal) {

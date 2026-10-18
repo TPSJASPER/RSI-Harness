@@ -18,7 +18,7 @@ export function createGeneratedTools({ cwd, genome }) {
         tool.container_script.entrypoint ?? "/bin/sh",
         ["-c", tool.container_script.script],
         {
-          cwd,
+          cwd: typeof cwd === "function" ? cwd() : cwd,
           env: {
             ...process.env,
             HARNESS_TOOL_ARGS: JSON.stringify(args),

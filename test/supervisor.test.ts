@@ -8,6 +8,7 @@ import {
   SUPERVISED_ENV,
   SWITCHED_FROM_ENV,
   SWITCH_REQUEST_ID_ENV,
+  RESTORED_EDITOR_ENV,
   restartArgv,
   supervise,
   takeSwitchRequest,
@@ -231,4 +232,48 @@ test("resume restart loads the target session's frozen Genome instead of passing
     sessionFile: "/sessions/selected.jsonl",
   });
   assert.deepEqual(restarted, ["--session", "/sessions/selected.jsonl", "--cwd", "/work"]);
+});
+
+test("in-app restarts discard consumed input and names while retaining option values", () => {
+  const argv = ["--genome", "old", "--name", "Initial A", "--cwd", "/work",
+    "--model", "initial prompt", "--extension", "@extension.ts", "--custom", "custom value",
+    "--verbose", "initial prompt", "@notes.md", "--", "--literal-message"];
+  assert.deepEqual(restartArgv(argv, { kind: "resume", reference: "target", sessionFile: "/b.jsonl" }),
+    ["--session", "/b.jsonl", "--cwd", "/work", "--model", "initial prompt",
+      "--extension", "@extension.ts", "--custom", "custom value", "--verbose"]);
+  assert.deepEqual(restartArgv(["-n", "Old name", "hello", "@notes.md"], { reference: "new" }),
+    ["--genome", "new"]);
+});
+
+test("startup restoration retains pending input once, without renaming the session again", () => {
+  const argv = ["--resume", "--name", "Target", "--cwd", "/work", "hello", "@notes.md", "--", "--literal"];
+  const startup = restartArgv(argv, { kind: "resume", reference: "target", sessionFile: "/b.jsonl",
+    preserveInitialMessages: true });
+  assert.deepEqual(startup, ["--session", "/b.jsonl", "--cwd", "/work", "hello", "@notes.md", "--", "--literal"]);
+  assert.deepEqual(restartArgv(startup, { kind: "resume", reference: "other", sessionFile: "/c.jsonl" }),
+    ["--session", "/c.jsonl", "--cwd", "/work"]);
+});
+
+test("restart input filtering follows Pi's extension-flag parsing and preserves RSIH paths", () => {
+  assert.deepEqual(restartArgv(["--custom", "@input.md", "--cwd", "@project", "--append-system-prompt", "--name"],
+    { kind: "resume", reference: "target", sessionFile: "/b.jsonl" }),
+    ["--session", "/b.jsonl", "--custom", "--cwd", "@project", "--append-system-prompt", "--name"]);
+});
+
+test("the supervisor carries a branch draft only to the requested restart", async t => {
+  const directory = mkdtempSync(join(tmpdir(), "rsih-editor-restore-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const calls = [];
+  await supervise({
+    command: "rsih", baseArgs: [], argv: [], agentDirectory: directory, env: {},
+    spawnChild: scriptedSpawn([
+      { before: ({ env }) => writeSwitchRequest(directory,
+        { kind: "resume", reference: "demo", sessionFile: "/a.jsonl", editorText: "Re-edit this question." }, env[SWITCH_REQUEST_ID_ENV]) },
+      { before: ({ env }) => writeSwitchRequest(directory,
+        { kind: "resume", reference: "demo", sessionFile: "/b.jsonl" }, env[SWITCH_REQUEST_ID_ENV]) },
+      {},
+    ], calls),
+  });
+  assert.equal(calls[1].env[RESTORED_EDITOR_ENV], "Re-edit this question.");
+  assert.equal(calls[2].env[RESTORED_EDITOR_ENV], undefined);
 });

@@ -1,11 +1,30 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createConfigurationSnapshot, findLatestSnapshot } from "../src/harness/configuration-snapshot.ts";
 import { latestSessionGenome, sessionBranchEntries, sessionForkBranchEntries, sessionGenomeChanged, sessionNeedsRestore } from "../src/harness/session-configuration.ts";
+import { createDefaultHarnessGenome } from "../src/harness/genome.ts";
+import { createGenomeSession, startupPromptRecord } from "../src/harness/genome-session.ts";
+import { createRuntimeSettings } from "../src/harness/runtime-settings.ts";
+import { createGenomeExtension, genomeActivation } from "../src/pi-cli-runtime.ts";
+import { SUPERVISED_ENV, takeSwitchRequest } from "../src/cli/supervisor.ts";
 
 function snapshot(settings) {
   return createConfigurationSnapshot(settings, {}, { genome: "demo", rsih: "0.1.0" });
 }
+
+test("the empty default Genome is identical across project directories", () => {
+  const genome = createDefaultHarnessGenome();
+  assert.equal(sessionGenomeChanged({ reference: "default", baseDirectory: "/a", genome },
+    { reference: "default", baseDirectory: "/b", genome }), false);
+  const custom = { ...genome, extensions: ["./extension.ts"] };
+  assert.equal(sessionGenomeChanged({ reference: "default", baseDirectory: "/a", genome: custom },
+    { reference: "default", baseDirectory: "/b", genome: custom }), true,
+    "a Genome with relative resources must still distinguish resource roots");
+});
 
 test("session snapshots only follow the active branch, not an unrelated later branch", () => {
   const a = snapshot({ steeringMode: "one-at-a-time" });
@@ -112,4 +131,85 @@ test("fork and clone preflight use the retained ancestry, including boundary ent
     activeSecond, latestSessionGenome(sessionForkBranchEntries(entries, "b-user", "before")),
   ), false, "forking within the active Genome remains allowed");
   assert.deepEqual(sessionForkBranchEntries(entries, "missing", "before"), []);
+});
+
+async function frozenTreeFixture(t, restoreSessionOnStartup = false) {
+  const root = mkdtempSync(join(tmpdir(), "rsih-frozen-tree-"));
+  const agent = join(root, "agent");
+  const cwd = join(root, "project");
+  mkdirSync(cwd);
+  const savedEnvironment = new Map(["PI_CODING_AGENT_DIR", "RSIH_CODING_AGENT_DIR", SUPERVISED_ENV]
+    .map(key => [key, process.env[key]]));
+  process.env.PI_CODING_AGENT_DIR = agent;
+  process.env.RSIH_CODING_AGENT_DIR = agent;
+  process.env[SUPERVISED_ENV] = "1";
+  t.after(() => {
+    for (const [key, value] of savedEnvironment) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(root, { recursive: true, force: true });
+  });
+  const manager = SessionManager.create(cwd, join(agent, "sessions"));
+  const oldGenome = { genome_schema_version: "2", genome_id: "harness:demo", version: 1,
+    extensions: ["./old-extension.ts"], settings: { steeringMode: "one-at-a-time" } };
+  const newGenome = { ...oldGenome, extensions: ["./new-extension.ts"], settings: { steeringMode: "all" } };
+  const record = genome => ({ reference: "demo", baseDirectory: root, genome });
+  manager.appendCustomEntry("rsih.genome", record(oldGenome));
+  manager.appendCustomEntry("rsih.configuration", snapshot(oldGenome.settings));
+  const selectedId = manager.appendMessage({ role: "user", content: [{ type: "text", text: "First question." }], timestamp: Date.now() });
+  manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "First answer." }], timestamp: Date.now() });
+  manager.appendCustomEntry("rsih.genome", record(newGenome));
+  manager.appendCustomEntry("rsih.configuration", snapshot(newGenome.settings));
+  const configuration = createRuntimeSettings(agent);
+  configuration.apply({ settings: newGenome.settings });
+  const session = createGenomeSession(genomeActivation(record(newGenome)), startupPromptRecord({}));
+  const handlers = new Map();
+  const pi = {
+    registerFlag() {}, registerCommand() {},
+    on(name, handler) { handlers.set(name, handler); },
+    appendEntry(name, data) { manager.appendCustomEntry(name, data); },
+  };
+  const factory = await createGenomeExtension({ session, configuration, restoreSessionOnStartup, profiles: {}, cwd });
+  await factory(pi);
+  let shutdown = false;
+  const ctx = { mode: "tui", sessionManager: manager,
+    ui: { getEditorText: () => "", notify() {} }, shutdown() { shutdown = true; } };
+  return { agent, manager, handlers, ctx, selectedId, oldGenome, shutdown: () => shutdown };
+}
+
+test("supervised tree restores a frozen branch and its editor text without duplicate snapshots", async t => {
+  const { agent, manager, handlers, ctx, selectedId, oldGenome, shutdown } = await frozenTreeFixture(t);
+  const before = await handlers.get("session_before_tree")({ preparation: { targetId: selectedId } }, ctx);
+  assert.notEqual(before?.cancel, true);
+  manager.branch(manager.getEntry(selectedId).parentId); // Pi re-edits a user entry from its parent.
+  await handlers.get("session_tree")({}, ctx);
+  assert.equal(shutdown(), true);
+  const request = takeSwitchRequest(agent);
+  assert.equal(request.kind, "resume");
+  assert.equal(request.sessionFile, manager.getSessionFile());
+  assert.equal(request.editorText, "First question.");
+  const entries = readFileSync(manager.getSessionFile(), "utf8").trim().split(/\r?\n/).map(line => JSON.parse(line));
+  const branch = sessionBranchEntries(entries);
+  assert.deepEqual(latestSessionGenome(branch).genome, oldGenome);
+  assert.equal(findLatestSnapshot(branch).settings.steeringMode, "one-at-a-time");
+  assert.equal(entries.filter(entry => entry.customType === "rsih.configuration").length, 2);
+  assert.equal(entries.at(-1).customType, "rsih.branch");
+});
+
+test("RPC still refuses a branch requiring different startup extensions", async t => {
+  const { manager, handlers, ctx, selectedId } = await frozenTreeFixture(t);
+  ctx.mode = "rpc";
+  const leaf = manager.getLeafId();
+  const result = await handlers.get("session_before_tree")({ preparation: { targetId: selectedId } }, ctx);
+  assert.equal(result.cancel, true);
+  assert.equal(manager.getLeafId(), leaf);
+});
+
+test("startup picker restoration marks initial messages as not yet consumed", async t => {
+  const { agent, manager, handlers, ctx, selectedId, shutdown } = await frozenTreeFixture(t, true);
+  manager.branch(manager.getEntry(selectedId).parentId);
+  await handlers.get("session_start")({ reason: "startup" }, ctx);
+  assert.equal(shutdown(), true);
+  assert.equal(takeSwitchRequest(agent).preserveInitialMessages, true);
 });

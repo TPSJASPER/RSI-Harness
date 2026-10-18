@@ -10,14 +10,15 @@ import test from "node:test";
 
 const repo = dirname(dirname(fileURLToPath(import.meta.url)));
 
-function rpc(cwd, home, agent, genome, profiles) {
+function rpc(cwd, home, agent, genome, profiles, extra = []) {
   const env = {};
   for (const key of ["SystemRoot", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP", "COMSPEC", "ProgramFiles", "ProgramFiles(x86)"]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
   Object.assign(env, { HOME: home, USERPROFILE: home, PI_OFFLINE: "1", PI_TELEMETRY: "0", PI_SKIP_VERSION_CHECK: "1", RSIH_CODING_AGENT_DIR: agent });
   const child = spawn(process.execPath, [join(repo, "src", "cli.ts"), "--mode", "rpc", "--offline",
-    "--cwd", cwd, "--genome", genome, "--config", profiles], { cwd, env, stdio: "pipe", windowsHide: true });
+    "--cwd", cwd, ...(genome ? ["--genome", genome] : []), "--config", profiles, ...extra],
+    { cwd, env, stdio: "pipe", windowsHide: true });
   const pending = new Map();
   let serial = 0;
   let stderr = "";
@@ -53,7 +54,7 @@ function rpc(cwd, home, agent, genome, profiles) {
       });
     },
     async close() {
-      if (child.exitCode !== null) return;
+      if (child.exitCode !== null || child.signalCode !== null) return;
       const exited = new Promise(resolve => child.once("exit", resolve));
       child.kill();
       await exited;
@@ -185,4 +186,114 @@ test("two concurrent sessions in one workspace keep independent Genome overlays"
   assert.notEqual(left.sessionFile, right.sessionFile);
   assert.equal((await a.request({ type: "get_state" })).steeringMode, "all");
   assert.equal((await b.request({ type: "get_state" })).steeringMode, "one-at-a-time");
+});
+
+async function complete(client, message) {
+  const before = await client.request({ type: "get_state" });
+  await client.request({ type: "prompt", message });
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const state = await client.request({ type: "get_state" });
+    if (!state.isStreaming && state.messageCount >= before.messageCount + 2) return state;
+    await delay(20);
+  }
+  assert.fail("The synthetic completion did not finish");
+}
+
+test("plain RPC sessions resume across projects with the target project's settings", { timeout: 60000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), "rsih-default-resume-"));
+  const agent = join(root, "agent");
+  const projects = [join(root, "a"), join(root, "b")];
+  for (const project of projects) mkdirSync(join(project, ".rsih", "genomes"), { recursive: true });
+  writeFileSync(join(projects[0], ".rsih", "settings.json"), JSON.stringify({ followUpMode: "all" }));
+  writeFileSync(join(projects[1], ".rsih", "settings.json"), JSON.stringify({ followUpMode: "one-at-a-time" }));
+  for (const [index, project] of projects.entries()) {
+    writeFileSync(join(project, ".rsih", "genomes", "local.json"), JSON.stringify({
+      genome_schema_version: "2",
+      genome_id: `harness:local-project-${index}`,
+      version: 1,
+      model: { profile: "mock", id: "audit" },
+      runtime: { steering_mode: index === 0 ? "one-at-a-time" : "all" },
+    }));
+  }
+  const profiles = join(root, "providers.json");
+  writeFileSync(profiles, JSON.stringify({ mock: { kind: "mock", model: "audit", mock_responses: ["ok"] } }));
+  const target = rpc(projects[1], root, agent, undefined, profiles, ["--profile", "mock", "--approve"]);
+  let source;
+  t.after(async () => {
+    await Promise.all([target.close(), source?.close()]);
+    rmSync(root, { recursive: true, force: true });
+  });
+  const saved = await complete(target, "Project B.");
+  await target.close();
+  source = rpc(projects[0], root, agent, undefined, profiles, ["--profile", "mock", "--approve"]);
+  const before = await source.request({ type: "get_state" });
+  assert.equal(before.followUpMode, "all");
+  const result = await source.request({ type: "switch_session", sessionPath: saved.sessionFile });
+  assert.equal(result.cancelled, false);
+  const after = await source.request({ type: "get_state" });
+  assert.notEqual(after.sessionId, before.sessionId);
+  assert.equal(after.sessionId, saved.sessionId);
+  assert.equal(after.followUpMode, "one-at-a-time");
+  await complete(source, "Continue project B.");
+  assert.match(readFileSync(saved.sessionFile, "utf8"), /Continue project B/);
+  await source.request({ type: "prompt", message: "/switch-genome local" });
+  assert.equal((await source.request({ type: "get_state" })).steeringMode, "all");
+});
+
+test("same-id Genome versions can switch and restore frozen history without adopting disk edits", { timeout: 90000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), "rsih-version-tree-"));
+  const agent = join(root, "agent");
+  const cwd = join(root, "project");
+  mkdirSync(cwd);
+  const profiles = join(root, "providers.json");
+  writeFileSync(profiles, JSON.stringify({ mock: { kind: "mock", model: "audit", mock_responses: ["ok"] } }));
+  const observer = join(root, "observer.ts");
+  const treeResult = join(root, "tree.json");
+  const promptResult = join(root, "prompt.txt");
+  writeFileSync(observer, `import { writeFileSync } from "node:fs";
+export default function(pi) {
+  pi.registerCommand("audit-tree", { description: "Synthetic tree audit", async handler(args, ctx) {
+    const result = await ctx.navigateTree(args.trim(), { summarize: false });
+    writeFileSync(${JSON.stringify(treeResult)}, JSON.stringify(result));
+  } });
+  pi.on("agent_start", (_event, ctx) => { writeFileSync(${JSON.stringify(promptResult)}, ctx.getSystemPrompt()); });
+}`);
+  const manifest = join(root, "genome.json");
+  const writeGenome = (mode, prompt) => writeFileSync(manifest, JSON.stringify({
+    genome_schema_version: "2", genome_id: "harness:version-tree", version: 1,
+    model: { profile: "mock", id: "audit" }, extensions: [observer],
+    settings: { steeringMode: mode }, append_system_prompt: prompt,
+  }));
+  writeGenome("one-at-a-time", "FROZEN_FIRST");
+  const client = rpc(cwd, root, agent, manifest, profiles);
+  let resumed;
+  t.after(async () => {
+    await Promise.all([client.close(), resumed?.close()]);
+    rmSync(root, { recursive: true, force: true });
+  });
+  const first = await complete(client, "First version.");
+  const entries = () => readFileSync(first.sessionFile, "utf8").trim().split(/\r?\n/).map(line => JSON.parse(line));
+  const firstLeaf = entries().at(-1).id;
+  writeGenome("all", "FROZEN_SECOND");
+  await client.request({ type: "prompt", message: `/switch-genome ${manifest}` });
+  assert.equal((await client.request({ type: "get_state" })).steeringMode, "all");
+  await complete(client, "Second version.");
+  const secondLeaf = entries().at(-1).id;
+  await client.close();
+  // A later unadopted edit must not influence either historical branch.
+  writeGenome("all", "UNADOPTED_DISK_EDIT");
+  resumed = rpc(cwd, root, agent, undefined, profiles, ["--session", first.sessionFile]);
+  await resumed.request({ type: "prompt", message: `/audit-tree ${firstLeaf}` });
+  assert.equal(JSON.parse(readFileSync(treeResult, "utf8")).cancelled, false);
+  assert.equal((await resumed.request({ type: "get_state" })).steeringMode, "one-at-a-time");
+  await complete(resumed, "Continue first branch.");
+  assert.match(readFileSync(promptResult, "utf8"), /FROZEN_FIRST/);
+  assert.doesNotMatch(readFileSync(promptResult, "utf8"), /FROZEN_SECOND|UNADOPTED_DISK_EDIT/);
+  await resumed.request({ type: "prompt", message: `/audit-tree ${secondLeaf}` });
+  assert.equal(JSON.parse(readFileSync(treeResult, "utf8")).cancelled, false);
+  assert.equal((await resumed.request({ type: "get_state" })).steeringMode, "all");
+  await complete(resumed, "Continue second branch.");
+  assert.match(readFileSync(promptResult, "utf8"), /FROZEN_SECOND/);
+  assert.doesNotMatch(readFileSync(promptResult, "utf8"), /FROZEN_FIRST|UNADOPTED_DISK_EDIT/);
+  assert.equal(entries().filter(entry => entry.customType === "rsih.configuration").length, 2);
 });

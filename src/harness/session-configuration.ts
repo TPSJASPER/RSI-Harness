@@ -4,6 +4,9 @@
  * parentId rather than scanning unrelated branches.
  */
 import { contentHash } from "../core/json.ts";
+import { createDefaultHarnessGenome } from "./genome.ts";
+
+const DEFAULT_GENOME_HASH = contentHash(createDefaultHarnessGenome());
 
 export function sessionBranchEntries(entries, leafId) {
   const byId = new Map(
@@ -48,8 +51,11 @@ export function latestSessionGenome(entries) {
 
 export function sessionGenomeChanged(current, target) {
   if (!target?.genome) return false;
+  // The empty default Genome has no resource paths rooted at the project cwd.
+  const defaultGenome = current.reference === "default" && target.reference === "default" &&
+    contentHash(current.genome) === DEFAULT_GENOME_HASH;
   return current.reference !== (target.reference ?? target.genome.genome_id) ||
-    (target.baseDirectory !== undefined && current.baseDirectory !== target.baseDirectory) ||
+    (!defaultGenome && target.baseDirectory !== undefined && current.baseDirectory !== target.baseDirectory) ||
     contentHash(current.genome) !== contentHash(target.genome);
 }
 

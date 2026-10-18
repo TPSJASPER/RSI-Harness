@@ -34,6 +34,7 @@ import {
   expandGenomeShorthand,
   genomeShorthandReference,
 } from "../src/cli/genome-shorthand.ts";
+import { restartArgv } from "../src/cli/supervisor.ts";
 
 const codeDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -464,6 +465,26 @@ test("a run id keeps one conversation alive across separate invocations", () => 
     1,
     "the Genome is recorded once, not re-stamped every turn",
   );
+});
+
+test("resume restart does not rename the target or replay its original launch message", t => {
+  const directory = mkdtempSync(join(tmpdir(), "rsih-cli-restart-input-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const providers = join(directory, "providers.json");
+  writeFileSync(providers, JSON.stringify({ mock: { kind: "mock", model: "audit", mock_responses: ["ok"] } }));
+  const initial = runCli(directory, ["-p", "Seed target.", "--name", "Target B", "--run-id", "target",
+    "--config", providers, "--profile", "mock", "--cwd", directory]);
+  assert.equal(initial.status, 0, initial.stderr);
+  const file = join(piSessionDir(directory), readdirSync(piSessionDir(directory))[0]);
+  const restarted = restartArgv(["--name", "Initial A", "Consumed launch message.",
+    "--config", providers, "--profile", "mock", "--cwd", directory],
+    { kind: "resume", reference: "default", sessionFile: file });
+  const resumed = runCli(directory, [...restarted, "-p", "Intentional continuation."]);
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const entries = sessionEntries(piSessionDir(directory));
+  assert.deepEqual(entries.filter(entry => entry.type === "session_info").map(entry => entry.name), ["Target B"]);
+  assert.deepEqual(entries.filter(entry => entry.type === "message" && entry.message.role === "user")
+    .map(entry => entry.message.content[0].text), ["Seed target.", "Intentional continuation."]);
 });
 
 test("--fork inherits the source Genome snapshot while creating a separate session", () => {
