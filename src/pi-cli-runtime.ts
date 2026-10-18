@@ -1365,7 +1365,7 @@ export async function createGenomeExtension({
       const projected = snapshot ?? projectGenomeSettings(session.current().genome);
       if (!sessionNeedsRestore(
         session.current(), branchGenome, configuration.snapshot(), snapshot,
-      ) && session.current() === active) return;
+      ) && session.current() === current) return;
       if (!sessionFile) return;
       if (!branchAnchored) {
         // Keep the selected ancestry as the file's active leaf when the
