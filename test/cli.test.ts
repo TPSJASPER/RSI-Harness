@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
@@ -35,6 +35,7 @@ import {
   genomeShorthandReference,
 } from "../src/cli/genome-shorthand.ts";
 import { restartArgv } from "../src/cli/supervisor.ts";
+import { installRememberedSessionListing } from "../src/harness/session-selector.ts";
 
 const codeDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -1076,4 +1077,104 @@ test("installing carries the whole payload, not just the executable", () => {
   assert.match(installScript, /npm run --silent install:binary/);
   // And it has to prove the payload arrived rather than trust the copy.
   assert.match(installScript, /rsih" genome validate paperlab/);
+});
+
+
+test("--fork expands ~/paths using the home directory like Pi", t => {
+  const directory = mkdtempSync(join(tmpdir(), "rsih-cli-tilde-fork-"));
+  const homeArchive = mkdtempSync(join(homedir(), ".rsih-tilde-fork-"));
+  t.after(() => {
+    rmSync(directory, { recursive: true, force: true });
+    rmSync(homeArchive, { recursive: true, force: true });
+  });
+  const providers = join(directory, "providers.json");
+  writeFileSync(providers, JSON.stringify({ mock: {
+    kind: "mock", model: "tilde-fork-model", mock_responses: ["ok"],
+  } }));
+  const args = ["-p", "Hello.", "--config", providers, "--profile", "mock", "--cwd", directory];
+  const original = runCli(directory, [...args, "--session-dir", homeArchive, "--run-id", "tilde-source"]);
+  assert.equal(original.status, 0, original.stderr);
+  const sourceFile = readdirSync(homeArchive).find(name => name.endsWith(".jsonl"));
+  assert.ok(sourceFile);
+  const relativeHome = homeArchive.slice(homedir().length + 1).replaceAll("\\", "/");
+  const fork = runCli(directory, [...args, "--fork", `~/${relativeHome}/${sourceFile}`, "--run-id", "tilde-target"]);
+  assert.equal(fork.status, 0, fork.stderr);
+  assert.equal(sessionEntries(piSessionDir(directory))[0].id, "tilde-target");
+});
+
+test("cross-project --fork starts the actual stdio MCP server in the target cwd", t => {
+  const directory = mkdtempSync(join(tmpdir(), "rsih-cli-mcp-fork-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const projectA = join(directory, "project-a");
+  const projectB = join(directory, "project-b");
+  mkdirSync(projectA);
+  mkdirSync(projectB);
+  const providers = join(directory, "providers.json");
+  const genomePath = join(directory, "genome.json");
+  const serverPath = join(directory, "cwd-server.mjs");
+  const observed = join(directory, "mcp-cwd.txt");
+  writeFileSync(providers, JSON.stringify({ mock: {
+    kind: "mock", model: "mcp-fork-model", mock_responses: ["ok"],
+  } }));
+  const sdkFile = name => pathToFileURL(join(codeDirectory, "node_modules",
+    "@modelcontextprotocol", "sdk", "dist", "esm", name)).href;
+  writeFileSync(serverPath, `
+import { writeFileSync } from "node:fs";
+import { Server } from ${JSON.stringify(sdkFile("server/index.js"))};
+import { StdioServerTransport } from ${JSON.stringify(sdkFile("server/stdio.js"))};
+import { ListToolsRequestSchema } from ${JSON.stringify(sdkFile("types.js"))};
+const server = new Server({ name: "cwd-probe", version: "1.0.0" }, { capabilities: { tools: {} } });
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+writeFileSync(${JSON.stringify(observed)}, process.cwd());
+await server.connect(new StdioServerTransport());
+`);
+  writeFileSync(genomePath, JSON.stringify(createHarnessGenome({
+    genome_id: "harness:mcp-target-cwd",
+    model: { profile: "mock", id: "mcp-fork-model" },
+    mcp: { servers: [{ name: "cwd-probe", command: process.execPath, args: [serverPath] }] },
+  })));
+  const args = cwd => ["-p", "Hello.", "--config", providers, "--profile", "mock", "--cwd", cwd];
+  const original = runCli(directory, [...args(projectA), "--genome", genomePath, "--run-id", "mcp-source"]);
+  assert.equal(original.status, 0, original.stderr);
+  assert.equal(readFileSync(observed, "utf8"), realpathSync(projectA));
+  const sourceDir = piSessionDir(projectA);
+  const source = join(sourceDir, readdirSync(sourceDir).find(name => name.endsWith(".jsonl")));
+  const fork = runCli(directory, [...args(projectB), "--fork", source, "--run-id", "mcp-target"]);
+  assert.equal(fork.status, 0, fork.stderr);
+  assert.equal(readFileSync(observed, "utf8"), realpathSync(projectB));
+  assert.equal(sessionEntries(piSessionDir(projectB))[0].cwd, realpathSync(projectB));
+});
+
+test("resume directory augmentation filters projects, removes duplicates and restores Pi methods", async () => {
+  const cwdA = "/project/a";
+  const cwdB = "/project/b";
+  const main = "/sessions/main";
+  const legacy = "/sessions/legacy";
+  const other = "/sessions/other";
+  const session = (id, cwd, path, modified) => ({
+    id, cwd, path, modified: new Date(modified),
+  });
+  const a = session("a", cwdA, "/sessions/main/a.jsonl", "2026-10-01");
+  const oldA = session("old-a", cwdA, "/sessions/legacy/old-a.jsonl", "2026-10-02");
+  const oldB = session("old-b", cwdB, "/sessions/legacy/old-b.jsonl", "2026-10-03");
+  const unrelated = session("other", cwdA, "/sessions/other/other.jsonl", "2026-10-04");
+  const dirs = new Map([[main, [a]], [legacy, [oldA, oldB]], [other, [unrelated]]]);
+  const manager = {
+    async list(cwd, directory) { return (dirs.get(directory) ?? []).filter(s => s.cwd === cwd); },
+    async listAll(directoryOrProgress) {
+      return typeof directoryOrProgress === "string" ? (dirs.get(directoryOrProgress) ?? []) : [a];
+    },
+  };
+  const originalList = manager.list;
+  const originalListAll = manager.listAll;
+  const restore = installRememberedSessionListing(manager, cwdA, main, [legacy, legacy, main]);
+  assert.deepEqual((await manager.list(cwdA, main)).map(s => s.id), ["old-a", "a"]);
+  assert.deepEqual((await manager.list(cwdB, main)).map(s => s.id), []);
+  assert.deepEqual((await manager.list(cwdA, other)).map(s => s.id), ["other"]);
+  assert.deepEqual((await manager.listAll()).map(s => s.id), ["old-b", "old-a", "a"]);
+  assert.deepEqual((await manager.listAll(other)).map(s => s.id), ["other"]);
+  restore();
+  assert.equal(manager.list, originalList);
+  assert.equal(manager.listAll, originalListAll);
+  assert.deepEqual((await manager.list(cwdA, main)).map(s => s.id), ["a"]);
 });
